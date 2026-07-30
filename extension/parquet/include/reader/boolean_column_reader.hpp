@@ -26,11 +26,20 @@ public:
 
 	uint8_t byte_pos;
 
+#ifndef __OSV__
 	void InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns, TProtocol &protocol_p) override {
 		byte_pos = 0;
 		TemplatedColumnReader<bool, BooleanParquetValueConversion>::InitializeRead(row_group_idx_p, columns,
 		                                                                           protocol_p);
 	}
+#else
+	void InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns, TProtocol &protocol_p,
+	                    ::osv_duckdb::PageDirectory *page_dir_p = nullptr) override {
+		byte_pos = 0;
+		TemplatedColumnReader<bool, BooleanParquetValueConversion>::InitializeRead(row_group_idx_p, columns,
+		                                                                           protocol_p, page_dir_p);
+	}
+#endif
 
 	void ResetPage() override {
 		byte_pos = 0;

@@ -27,7 +27,12 @@ public:
 public:
 	ColumnReader &GetChildReader(idx_t child_idx);
 
+#ifndef __OSV__
 	void InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns, TProtocol &protocol_p) override;
+#else
+	void InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns, TProtocol &protocol_p,
+	                    ::osv_duckdb::PageDirectory *page_dir_p = nullptr) override;
+#endif
 
 	idx_t Read(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result) override;
 

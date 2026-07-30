@@ -8,6 +8,10 @@
 
 #pragma once
 
+#ifdef __OSV__
+#include "osv_parquet_file_handle.hpp"
+#endif
+
 #include "duckdb.hpp"
 #include "parquet_bss_decoder.hpp"
 #include "parquet_statistics.hpp"
@@ -67,7 +71,12 @@ public:
 
 public:
 	static unique_ptr<ColumnReader> CreateReader(const ParquetReader &reader, const ParquetColumnSchema &schema);
+#ifndef __OSV__
 	virtual void InitializeRead(idx_t row_group_index, const vector<ColumnChunk> &columns, TProtocol &protocol_p);
+#else
+	virtual void InitializeRead(idx_t row_group_index, const vector<ColumnChunk> &columns, TProtocol &protocol_p,
+	                            ::osv_duckdb::PageDirectory *page_dir_p = nullptr);
+#endif
 	virtual idx_t Read(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result_out);
 	virtual void Select(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result_out,
 	                    const SelectionVector &sel, idx_t approved_tuple_count);
@@ -197,6 +206,9 @@ protected:
 	void ReadDataEncrypted(const data_ptr_t buffer, const uint32_t buffer_size, PageType::type module);
 	void Read(PageHeader &page_hdr);
 	void ReadData(const data_ptr_t buffer, const uint32_t buffer_size, PageType::type page_type);
+#ifdef __OSV__
+	void ReadPageHeaderOptimistic(PageHeader &page_hdr);
+#endif
 
 private:
 	//! Check if a previous table filter has filtered out this page
@@ -323,6 +335,14 @@ private:
 	idx_t page_rows_available;
 	idx_t group_rows_available;
 	idx_t chunk_read_offset;
+
+#ifdef __OSV__
+	::osv_duckdb::PageDirectory *page_dir        = nullptr;
+	idx_t                        row_group_idx    = 0;
+	idx_t                        global_page_idx  = 0;
+	idx_t                        current_page_idx = 0;
+	const char                  *vma_base         = nullptr;
+#endif
 
 	shared_ptr<ResizeableBuffer> block;
 

@@ -18,6 +18,7 @@ ColumnReader &StructColumnReader::GetChildReader(idx_t child_idx) {
 	return *child_readers[child_idx].get();
 }
 
+#ifndef __OSV__
 void StructColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns,
                                         TProtocol &protocol_p) {
 	for (auto &child : child_readers) {
@@ -27,6 +28,17 @@ void StructColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<Colu
 		child->InitializeRead(row_group_idx_p, columns, protocol_p);
 	}
 }
+#else
+void StructColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns,
+                                        TProtocol &protocol_p, ::osv_duckdb::PageDirectory *page_dir_p) {
+	for (auto &child : child_readers) {
+		if (!child) {
+			continue;
+		}
+		child->InitializeRead(row_group_idx_p, columns, protocol_p, page_dir_p);
+	}
+}
+#endif
 
 idx_t StructColumnReader::Read(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result) {
 	auto &struct_entries = StructVector::GetEntries(result);

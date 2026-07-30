@@ -28,7 +28,12 @@ public:
 	            const TableFilter &filter, TableFilterState &filter_state, SelectionVector &sel,
 	            idx_t &approved_tuple_count, bool is_first_filter) override;
 
+#ifndef __OSV__
 	void InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns, TProtocol &protocol_p) override;
+#else
+	void InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns, TProtocol &protocol_p,
+	                    ::osv_duckdb::PageDirectory *page_dir_p = nullptr) override;
+#endif
 
 	void Skip(idx_t num_values) override {
 		row_group_offset += num_values;

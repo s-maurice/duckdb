@@ -32,6 +32,7 @@ ColumnReader &VariantColumnReader::GetChildReader(idx_t child_idx) {
 	return *child_readers[child_idx].get();
 }
 
+#ifndef __OSV__
 void VariantColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns,
                                          TProtocol &protocol_p) {
 	for (auto &child : child_readers) {
@@ -41,6 +42,17 @@ void VariantColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<Col
 		child->InitializeRead(row_group_idx_p, columns, protocol_p);
 	}
 }
+#else
+void VariantColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns,
+                                         TProtocol &protocol_p, ::osv_duckdb::PageDirectory *page_dir_p) {
+	for (auto &child : child_readers) {
+		if (!child) {
+			continue;
+		}
+		child->InitializeRead(row_group_idx_p, columns, protocol_p, page_dir_p);
+	}
+}
+#endif
 
 static LogicalType GetIntermediateGroupType(optional_ptr<ColumnReader> typed_value) {
 	child_list_t<LogicalType> children;

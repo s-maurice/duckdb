@@ -11,8 +11,13 @@ RowNumberColumnReader::RowNumberColumnReader(const ParquetReader &reader, const 
     : ColumnReader(reader, schema) {
 }
 
+#ifndef __OSV__
 void RowNumberColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns,
                                            TProtocol &protocol_p) {
+#else
+void RowNumberColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns,
+                                           TProtocol &protocol_p, ::osv_duckdb::PageDirectory *) {
+#endif
 	row_group_offset = 0;
 	auto &row_groups = reader.GetFileMetadata()->row_groups;
 	for (idx_t i = 0; i < row_group_idx_p; i++) {

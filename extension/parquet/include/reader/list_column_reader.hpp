@@ -25,9 +25,16 @@ public:
 
 	void ApplyPendingSkips(data_ptr_t define_out, data_ptr_t repeat_out) override;
 
+#ifndef __OSV__
 	void InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns, TProtocol &protocol_p) override {
 		child_column_reader->InitializeRead(row_group_idx_p, columns, protocol_p);
 	}
+#else
+	void InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns, TProtocol &protocol_p,
+	                    ::osv_duckdb::PageDirectory *page_dir_p = nullptr) override {
+		child_column_reader->InitializeRead(row_group_idx_p, columns, protocol_p, page_dir_p);
+	}
+#endif
 
 	idx_t GroupRowsAvailable() override {
 		return child_column_reader->GroupRowsAvailable() + overflow_child_count;

@@ -23,10 +23,17 @@ ExpressionColumnReader::ExpressionColumnReader(ClientContext &context, unique_pt
 	intermediate_chunk.Initialize(reader.allocator, intermediate_types);
 }
 
+#ifndef __OSV__
 void ExpressionColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns,
                                             TProtocol &protocol_p) {
 	child_reader->InitializeRead(row_group_idx_p, columns, protocol_p);
 }
+#else
+void ExpressionColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns,
+                                            TProtocol &protocol_p, ::osv_duckdb::PageDirectory *page_dir_p) {
+	child_reader->InitializeRead(row_group_idx_p, columns, protocol_p, page_dir_p);
+}
+#endif
 
 idx_t ExpressionColumnReader::Read(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result) {
 	intermediate_chunk.Reset();

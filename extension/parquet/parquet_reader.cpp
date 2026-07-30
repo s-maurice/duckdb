@@ -57,6 +57,59 @@ CreateThriftFileProtocol(QueryContext /*context*/, ::osv_duckdb::OsvCachingFileH
 	return make_uniq<duckdb_apache::thrift::protocol::TCompactProtocolT<::osv_duckdb::OsvThriftFileTransport>>(
 	    std::move(transport));
 }
+
+static ::osv_duckdb::PageDirectory
+BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckdb::string &path) {
+	using ::osv_duckdb::PageDirectory;
+	using ::osv_duckdb::PageEntry;
+
+	const auto &row_groups = meta.row_groups;
+	const idx_t num_rgs    = static_cast<idx_t>(row_groups.size());
+	const idx_t num_cols   = num_rgs > 0 ? static_cast<idx_t>(row_groups[0].columns.size()) : 0;
+
+	PageDirectory dir;
+	dir.num_cols = num_cols;
+	dir.chunk_start.resize(num_rgs * num_cols, 0);
+
+	auto fh        = fs.OpenFile(path, duckdb::FileOpenFlags::FILE_FLAGS_READ);
+	idx_t filesize = static_cast<idx_t>(fs.GetFileSize(*fh));
+	auto transport = duckdb_base_std::make_shared<::osv_duckdb::SimpleFileTransport>(fs, *fh, filesize);
+	duckdb_apache::thrift::protocol::TCompactProtocolT<::osv_duckdb::SimpleFileTransport> proto(transport);
+
+	for (idx_t rg = 0; rg < num_rgs; rg++) {
+		const auto &row_group = row_groups[rg];
+		for (idx_t col = 0; col < num_cols; col++) {
+			const auto &chunk_meta = row_group.columns[col].meta_data;
+
+			idx_t file_offset = static_cast<idx_t>(chunk_meta.data_page_offset);
+			if (chunk_meta.__isset.dictionary_page_offset && chunk_meta.dictionary_page_offset >= 4)
+				file_offset = static_cast<idx_t>(chunk_meta.dictionary_page_offset);
+			if (chunk_meta.__isset.index_page_offset)
+				file_offset = MinValue<idx_t>(file_offset, static_cast<idx_t>(chunk_meta.index_page_offset));
+
+			dir.chunk_start[rg * num_cols + col] = static_cast<idx_t>(dir.pages.size());
+
+			idx_t consumed = 0;
+			idx_t total    = static_cast<idx_t>(chunk_meta.total_compressed_size);
+			transport->SetLocation(file_offset);
+
+			while (consumed < total) {
+				idx_t page_start = transport->GetLocation();
+				duckdb_parquet::PageHeader page_hdr;
+				page_hdr.read(&proto);
+				idx_t header_size = transport->GetLocation() - page_start;
+				idx_t body_size   = static_cast<idx_t>(page_hdr.compressed_page_size);
+
+				dir.pages.emplace_back(page_start, header_size, body_size);
+
+				transport->Skip(body_size);
+				consumed += header_size + body_size;
+			}
+		}
+	}
+
+	return dir;
+}
 #endif
 
 static bool ShouldAndCanPrefetch(ClientContext &context, CachingFileHandle &file_handle) {
@@ -939,6 +992,18 @@ ParquetReader::ParquetReader(ClientContext &context_p, OpenFileInfo file_p, Parq
 	} else {
 		metadata = std::move(metadata_p);
 	}
+
+#ifdef __OSV__
+	{
+		auto *osv_fs = dynamic_cast<::osv_duckdb::OsvParquetFileSystemBase *>(
+		    DBConfig::GetConfig(context_p).file_system.get());
+		if (osv_fs && file_handle->page_dir == nullptr) {
+			auto dir = BuildPageDirectory(*metadata->metadata, osv_fs->InnerFS(), file.path);
+			file_handle->page_dir = osv_fs->StorePageDirectory(file.path, std::move(dir));
+		}
+	}
+#endif
+
 	InitializeSchema(context_p);
 }
 
@@ -1284,8 +1349,13 @@ void ParquetReader::PrepareRowGroupBuffer(ParquetReaderScanState &state, idx_t i
 		}
 	}
 
+#ifndef __OSV__
 	state.root_reader->InitializeRead(state.group_idx_list[state.current_group], group.columns,
 	                                  *state.thrift_file_proto);
+#else
+	state.root_reader->InitializeRead(state.group_idx_list[state.current_group], group.columns,
+	                                  *state.thrift_file_proto, state.file_handle->page_dir);
+#endif
 }
 
 idx_t ParquetReader::NumRows() const {

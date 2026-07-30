@@ -187,7 +187,12 @@ void ColumnReader::PlainSelect(shared_ptr<ResizeableBuffer> &plain_data, uint8_t
 	throw NotImplementedException("PlainSelect not implemented");
 }
 
+#ifndef __OSV__
 void ColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns, TProtocol &protocol_p) {
+#else
+void ColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns, TProtocol &protocol_p,
+                                   ::osv_duckdb::PageDirectory *page_dir_p) {
+#endif
 	D_ASSERT(ColumnIndex() < columns.size());
 	chunk = &columns[ColumnIndex()];
 	protocol = &protocol_p;
@@ -206,6 +211,15 @@ void ColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChun
 		chunk_read_offset = chunk->meta_data.dictionary_page_offset;
 	}
 	group_rows_available = chunk->meta_data.num_values;
+
+#ifdef __OSV__
+	D_ASSERT(page_dir_p != nullptr);
+	page_dir       = page_dir_p;
+	row_group_idx  = row_group_idx_p;
+	vma_base       = reader.GetHandle().vma_base;
+	D_ASSERT(vma_base != nullptr);
+	global_page_idx = page_dir->chunk_start[row_group_idx * page_dir->num_cols + ColumnIndex()];
+#endif
 }
 
 bool ColumnReader::PageIsFilteredOut(PageHeader &page_hdr) {
@@ -249,6 +263,48 @@ void ColumnReader::ReadDataEncrypted(const data_ptr_t buffer, const uint32_t buf
 	reader.ReadDataEncrypted(*protocol, buffer, buffer_size, aad_crypto_metadata);
 }
 
+#ifdef __OSV__
+void ColumnReader::ReadPageHeaderOptimistic(PageHeader &page_hdr) {
+	if (reader.parquet_options.encryption_config) {
+		osv_duckdb::ScopedPagePin _pin(page_dir, global_page_idx, vma_base);
+		Read(page_hdr);
+		return;
+	}
+	auto &trans = GetParquetTransport(*protocol);
+	const idx_t start_pos = trans.GetLocation();
+
+	auto &entry = page_dir->pages[global_page_idx];
+	auto &ps = entry.lock;
+	const size_t cpu_slot = osv_duckdb::GetThreadSlot();
+	osv_duckdb::u64 &local_version = page_dir->thread_versions[cpu_slot][global_page_idx];
+
+	osv_duckdb::validateFlushTlb(ps, local_version, vma_base + entry.offset,
+	                              static_cast<osv_duckdb::u64>(entry.page_size()));
+	const osv_duckdb::u64 v = local_version;
+
+	std::vector<uint8_t> buf(entry.header_size);
+	std::memcpy(buf.data(), vma_base + start_pos, entry.header_size);
+
+	if (ps.validateRead(v)) {
+		osv_duckdb::MemoryBufferTransport mem_trans_obj(buf.data(), static_cast<uint32_t>(entry.header_size));
+		auto mem_trans = duckdb_base_std::shared_ptr<osv_duckdb::MemoryBufferTransport>(
+		    &mem_trans_obj, [](osv_duckdb::MemoryBufferTransport *) {});
+		duckdb_apache::thrift::protocol::TCompactProtocolT<osv_duckdb::MemoryBufferTransport> mem_proto(mem_trans);
+		try {
+			reader.Read(page_hdr, mem_proto);
+			trans.Skip(mem_trans_obj.GetPosition());
+			return;
+		} catch (...) {
+			page_hdr = PageHeader{};
+		}
+	}
+
+	// Fallback: validation failed — take shared lock and read directly.
+	osv_duckdb::ScopedPagePin _pin(page_dir, global_page_idx, vma_base);
+	Read(page_hdr);
+}
+#endif
+
 void ColumnReader::Read(PageHeader &page_hdr) {
 	if (reader.parquet_options.encryption_config) {
 		ReadEncrypted(page_hdr);
@@ -273,6 +329,9 @@ void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_
 	PageHeader page_hdr;
 	auto &trans = GetParquetTransport(*protocol);
 
+#ifdef __OSV__
+	ReadPageHeaderOptimistic(page_hdr);
+#else
 	if (trans.HasPrefetch()) {
 		// Already has some data prefetched, let's not mess with it
 		Read(page_hdr);
@@ -285,10 +344,15 @@ void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_
 		Read(page_hdr);
 		trans.ClearPrefetch();
 	}
+#endif
 	// some basic sanity check
 	if (page_hdr.compressed_page_size < 0 || page_hdr.uncompressed_page_size < 0) {
 		throw InvalidInputException("Failed to read file \"%s\": Page sizes can't be < 0", Reader().GetFileName());
 	}
+
+#ifdef __OSV__
+	current_page_idx = global_page_idx++;
+#endif
 
 	if (PageIsFilteredOut(page_hdr)) {
 		// this page has been filtered out so we don't need to read it
@@ -325,6 +389,23 @@ void ColumnReader::ResetPage() {
 
 void ColumnReader::PreparePageV2(PageHeader &page_hdr) {
 	D_ASSERT(page_hdr.type == PageType::DATA_PAGE_V2);
+
+#ifdef __OSV__
+	if (vma_base && !chunk->__isset.crypto_metadata &&
+	    chunk->meta_data.codec == CompressionCodec::UNCOMPRESSED) {
+		if (page_hdr.compressed_page_size != page_hdr.uncompressed_page_size) {
+			throw InvalidInputException("Failed to read file \"%s\": Page size mismatch", Reader().GetFileName());
+		}
+		auto &trans = GetParquetTransport(*protocol);
+		block = make_shared_ptr<osv_duckdb::VmaPinnedBuffer>(
+		    vma_base + trans.GetLocation(),
+		    static_cast<uint64_t>(page_hdr.compressed_page_size),
+		    page_dir, current_page_idx, vma_base);
+		trans.Skip(page_hdr.compressed_page_size);
+		return;
+	}
+	osv_duckdb::ScopedPagePin _pin(page_dir, current_page_idx, vma_base);
+#endif
 
 	AllocateBlock(page_hdr.uncompressed_page_size + 1);
 	bool uncompressed = false;
@@ -376,6 +457,24 @@ void ColumnReader::AllocateBlock(idx_t size) {
 }
 
 void ColumnReader::PreparePage(PageHeader &page_hdr) {
+#ifdef __OSV__
+	if (vma_base && !chunk->__isset.crypto_metadata &&
+	    chunk->meta_data.codec == CompressionCodec::UNCOMPRESSED) {
+		uint32_t compressed_page_size = page_hdr.compressed_page_size;
+		if (compressed_page_size != NumericCast<uint32_t>(page_hdr.uncompressed_page_size)) {
+			throw std::runtime_error("Page size mismatch");
+		}
+		auto &trans = GetParquetTransport(*protocol);
+		block = make_shared_ptr<osv_duckdb::VmaPinnedBuffer>(
+		    vma_base + trans.GetLocation(),
+		    static_cast<uint64_t>(compressed_page_size),
+		    page_dir, current_page_idx, vma_base);
+		trans.Skip(compressed_page_size);
+		return;
+	}
+	osv_duckdb::ScopedPagePin _pin(page_dir, current_page_idx, vma_base);
+#endif
+
 	AllocateBlock(page_hdr.uncompressed_page_size + 1);
 	uint32_t compressed_page_size = page_hdr.compressed_page_size;
 

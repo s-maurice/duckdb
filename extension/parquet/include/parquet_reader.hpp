@@ -205,7 +205,8 @@ public:
 	unique_ptr<BaseStatistics> ReadStatistics(const string &name);
 
 #ifdef __OSV__
-	::osv_duckdb::OsvCachingFileHandle &GetHandle() { return *file_handle; }
+	::osv_duckdb::OsvCachingFileHandle &GetHandle()       { return *file_handle; }
+	const ::osv_duckdb::OsvCachingFileHandle &GetHandle() const { return *file_handle; }
 #else
 	CachingFileHandle &GetHandle() { return *file_handle; }
 #endif
