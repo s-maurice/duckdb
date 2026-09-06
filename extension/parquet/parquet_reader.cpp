@@ -78,25 +78,46 @@ BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckd
 
 	for (idx_t rg = 0; rg < num_rgs; rg++) {
 		const auto &row_group = row_groups[rg];
+		// One chunk per schema leaf, and chunk_start indexes rg * num_cols + col.
+		if (static_cast<idx_t>(row_group.columns.size()) != num_cols)
+			throw InvalidInputException("File '%s' row group %llu has %llu columns, expected %llu",
+			                            path, (unsigned long long)rg,
+			                            (unsigned long long)row_group.columns.size(),
+			                            (unsigned long long)num_cols);
 		for (idx_t col = 0; col < num_cols; col++) {
-			const auto &chunk_meta = row_group.columns[col].meta_data;
+			dir.chunk_start[rg * num_cols + col] = static_cast<idx_t>(dir.pages.size());
+			const auto &chunk = row_group.columns[col];
+			// Optional in the spec: metadata can live in the file named by file_path.
+			if (!chunk.__isset.meta_data)
+				throw InvalidInputException("File '%s' row group %llu column %llu has no metadata",
+				                            path, (unsigned long long)rg, (unsigned long long)col);
+			const auto &chunk_meta = chunk.meta_data;
 
+			// Include dictionary pages in the page index if they exist. Otherwise,
+			// index of the first data page. We ignore index pages.
 			idx_t file_offset = static_cast<idx_t>(chunk_meta.data_page_offset);
 			if (chunk_meta.__isset.dictionary_page_offset && chunk_meta.dictionary_page_offset >= 4)
 				file_offset = static_cast<idx_t>(chunk_meta.dictionary_page_offset);
-			if (chunk_meta.__isset.index_page_offset)
-				file_offset = MinValue<idx_t>(file_offset, static_cast<idx_t>(chunk_meta.index_page_offset));
-
-			dir.chunk_start[rg * num_cols + col] = static_cast<idx_t>(dir.pages.size());
 
 			idx_t consumed = 0;
 			idx_t total    = static_cast<idx_t>(chunk_meta.total_compressed_size);
+			idx_t page_idx = 0;
 			transport->SetLocation(file_offset);
 
 			while (consumed < total) {
 				idx_t page_start = transport->GetLocation();
 				duckdb_parquet::PageHeader page_hdr;
-				page_hdr.read(&proto);
+				try {
+					page_hdr.read(&proto);
+				} catch (std::exception &e) {
+					std::printf("[pagedir] parse failed rg=%llu col=%llu page=%llu offset=%llu "
+					            "chunk_start=%llu consumed=%llu/%llu: %s\n",
+					            (unsigned long long)rg, (unsigned long long)col,
+					            (unsigned long long)page_idx, (unsigned long long)page_start,
+					            (unsigned long long)file_offset, (unsigned long long)consumed,
+					            (unsigned long long)total, e.what());
+					throw;
+				}
 				idx_t header_size = transport->GetLocation() - page_start;
 				idx_t body_size   = static_cast<idx_t>(page_hdr.compressed_page_size);
 
@@ -104,10 +125,18 @@ BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckd
 
 				transport->Skip(body_size);
 				consumed += header_size + body_size;
+				page_idx++;
 			}
+			if (consumed != total)
+				std::printf("[pagedir] chunk overrun rg=%llu col=%llu consumed=%llu total=%llu\n",
+				            (unsigned long long)rg, (unsigned long long)col,
+				            (unsigned long long)consumed, (unsigned long long)total);
 		}
 	}
 
+	std::printf("[pagedir] built rgs=%llu cols=%llu pages=%llu\n",
+	            (unsigned long long)num_rgs, (unsigned long long)num_cols,
+	            (unsigned long long)dir.pages.size());
 	return dir;
 }
 #endif
