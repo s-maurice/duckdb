@@ -71,6 +71,14 @@ BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckd
 	dir.num_cols = num_cols;
 	dir.chunk_start.resize(num_rgs * num_cols, 0);
 
+	// Per column chunk bloom filter stats.
+	idx_t bf_n = 0, bf_bytes = 0, bf_no_len = 0;
+	idx_t bf_min_off = ~static_cast<idx_t>(0), bf_max_end = 0;
+	idx_t bf_min_len = ~static_cast<idx_t>(0), bf_max_len = 0;
+
+	idx_t max_header_size = 0;
+	idx_t headers_over_stack_buf = 0;
+
 	auto fh        = fs.OpenFile(path, duckdb::FileOpenFlags::FILE_FLAGS_READ);
 	idx_t filesize = static_cast<idx_t>(fs.GetFileSize(*fh));
 	auto transport = duckdb_base_std::make_shared<::osv_duckdb::SimpleFileTransport>(fs, *fh, filesize);
@@ -92,6 +100,23 @@ BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckd
 				throw InvalidInputException("File '%s' row group %llu column %llu has no metadata",
 				                            path, (unsigned long long)rg, (unsigned long long)col);
 			const auto &chunk_meta = chunk.meta_data;
+
+			// Calculate the chunk's bloom filter size for stats.
+			if (chunk_meta.__isset.bloom_filter_offset && chunk_meta.bloom_filter_offset > 0) {
+				const idx_t bf_off = static_cast<idx_t>(chunk_meta.bloom_filter_offset);
+				// Length is optional: without it a reader cannot size the region up front.
+				const idx_t bf_len = chunk_meta.__isset.bloom_filter_length && chunk_meta.bloom_filter_length > 0
+				                         ? static_cast<idx_t>(chunk_meta.bloom_filter_length)
+				                         : 0;
+				if (bf_len == 0)
+					bf_no_len++;
+				bf_n++;
+				bf_bytes += bf_len;
+				if (bf_off < bf_min_off) bf_min_off = bf_off;
+				if (bf_off + bf_len > bf_max_end) bf_max_end = bf_off + bf_len;
+				if (bf_len < bf_min_len) bf_min_len = bf_len;
+				if (bf_len > bf_max_len) bf_max_len = bf_len;
+			}
 
 			// Include dictionary pages in the page index if they exist. Otherwise,
 			// index of the first data page. We ignore index pages.
@@ -123,6 +148,11 @@ BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckd
 
 				dir.pages.emplace_back(page_start, header_size, body_size);
 
+				if (header_size > max_header_size)
+					max_header_size = header_size;
+				if (header_size > ::osv_duckdb::MaxStackHeaderSize)
+					headers_over_stack_buf++;
+
 				transport->Skip(body_size);
 				consumed += header_size + body_size;
 				page_idx++;
@@ -137,6 +167,25 @@ BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckd
 	std::printf("[pagedir] built rgs=%llu cols=%llu pages=%llu\n",
 	            (unsigned long long)num_rgs, (unsigned long long)num_cols,
 	            (unsigned long long)dir.pages.size());
+	std::printf("[pagedir] page headers: max=%llu B  over the %llu B stack buffer=%llu\n",
+	            (unsigned long long)max_header_size,
+	            (unsigned long long)::osv_duckdb::MaxStackHeaderSize,
+	            (unsigned long long)headers_over_stack_buf);
+	if (bf_n == 0) {
+		std::printf("[pagedir] bloom: none  filesize=%llu\n", (unsigned long long)filesize);
+	} else {
+		const idx_t span = bf_max_end - bf_min_off;
+		std::printf("[pagedir] bloom: n=%llu bytes=%llu (%.2f MiB) len=[%llu,%llu] no_len=%llu\n",
+		            (unsigned long long)bf_n, (unsigned long long)bf_bytes,
+		            (double)bf_bytes / 1048576.0, (unsigned long long)bf_min_len,
+		            (unsigned long long)bf_max_len, (unsigned long long)bf_no_len);
+		std::printf("[pagedir] bloom: span=[%llu,%llu)=%llu (%.2f MiB, %llu 4K pages) "
+		            "filesize=%llu tail=%.1f%%\n",
+		            (unsigned long long)bf_min_off, (unsigned long long)bf_max_end,
+		            (unsigned long long)span, (double)span / 1048576.0,
+		            (unsigned long long)((span + 4095) / 4096), (unsigned long long)filesize,
+		            filesize ? 100.0 * (double)(filesize - bf_min_off) / (double)filesize : 0.0);
+	}
 	return dir;
 }
 #endif

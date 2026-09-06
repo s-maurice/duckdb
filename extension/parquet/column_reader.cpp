@@ -275,6 +275,18 @@ void ColumnReader::ReadPageHeaderOptimistic(PageHeader &page_hdr) {
 
 	auto &entry = page_dir->pages[global_page_idx];
 	auto &ps = entry.lock;
+
+	// Page header doesn't fit in the stack buffer, doing non-optimistic (pinned) read instead.
+	if (entry.header_size > osv_duckdb::MaxStackHeaderSize) {
+		std::printf("[pagedir] page header %llu B doesn't fit in the %llu B stack buffer, "
+		            "doing non-optimistic (pinned) read instead\n",
+		            (unsigned long long)entry.header_size,
+		            (unsigned long long)osv_duckdb::MaxStackHeaderSize);
+		osv_duckdb::ScopedPagePin _pin(page_dir, global_page_idx, vma_base);
+		Read(page_hdr);
+		return;
+	}
+
 	const size_t cpu_slot = osv_duckdb::GetThreadSlot();
 	osv_duckdb::u64 &local_version = page_dir->thread_versions[cpu_slot][global_page_idx];
 
@@ -282,13 +294,14 @@ void ColumnReader::ReadPageHeaderOptimistic(PageHeader &page_hdr) {
 	                              static_cast<osv_duckdb::u64>(entry.page_size()));
 	const osv_duckdb::u64 v = local_version;
 
-	std::vector<uint8_t> buf(entry.header_size);
-	std::memcpy(buf.data(), vma_base + start_pos, entry.header_size);
+	uint8_t buf[osv_duckdb::MaxStackHeaderSize];
+	std::memcpy(buf, vma_base + start_pos, entry.header_size);
 
 	if (ps.validateRead(v)) {
-		osv_duckdb::MemoryBufferTransport mem_trans_obj(buf.data(), static_cast<uint32_t>(entry.header_size));
-		auto mem_trans = duckdb_base_std::shared_ptr<osv_duckdb::MemoryBufferTransport>(
-		    &mem_trans_obj, [](osv_duckdb::MemoryBufferTransport *) {});
+		osv_duckdb::MemoryBufferTransport mem_trans_obj(buf, static_cast<uint32_t>(entry.header_size));
+		// Non-owning, and no control block to allocate.
+		using MemTransPtr = duckdb_base_std::shared_ptr<osv_duckdb::MemoryBufferTransport>;
+		MemTransPtr mem_trans(MemTransPtr(), &mem_trans_obj);
 		duckdb_apache::thrift::protocol::TCompactProtocolT<osv_duckdb::MemoryBufferTransport> mem_proto(mem_trans);
 		try {
 			reader.Read(page_hdr, mem_proto);
