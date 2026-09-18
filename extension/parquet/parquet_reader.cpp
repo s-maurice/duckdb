@@ -70,6 +70,7 @@ BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckd
 	PageDirectory dir;
 	dir.num_cols = num_cols;
 	dir.chunk_start.resize(num_rgs * num_cols, 0);
+	dir.chunk_page_count.resize(num_rgs * num_cols, 0);
 
 	// Per column chunk bloom filter stats.
 	idx_t bf_n = 0, bf_bytes = 0, bf_no_len = 0;
@@ -77,7 +78,6 @@ BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckd
 	idx_t bf_min_len = ~static_cast<idx_t>(0), bf_max_len = 0;
 
 	idx_t max_header_size = 0;
-	idx_t headers_over_stack_buf = 0;
 
 	auto fh        = fs.OpenFile(path, duckdb::FileOpenFlags::FILE_FLAGS_READ);
 	idx_t filesize = static_cast<idx_t>(fs.GetFileSize(*fh));
@@ -150,13 +150,12 @@ BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckd
 
 				if (header_size > max_header_size)
 					max_header_size = header_size;
-				if (header_size > ::osv_duckdb::MaxStackHeaderSize)
-					headers_over_stack_buf++;
 
 				transport->Skip(body_size);
 				consumed += header_size + body_size;
 				page_idx++;
 			}
+			dir.chunk_page_count[rg * num_cols + col] = page_idx;
 			if (consumed != total)
 				std::printf("[pagedir] chunk overrun rg=%llu col=%llu consumed=%llu total=%llu\n",
 				            (unsigned long long)rg, (unsigned long long)col,
@@ -167,10 +166,7 @@ BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckd
 	std::printf("[pagedir] built rgs=%llu cols=%llu pages=%llu\n",
 	            (unsigned long long)num_rgs, (unsigned long long)num_cols,
 	            (unsigned long long)dir.pages.size());
-	std::printf("[pagedir] page headers: max=%llu B  over the %llu B stack buffer=%llu\n",
-	            (unsigned long long)max_header_size,
-	            (unsigned long long)::osv_duckdb::MaxStackHeaderSize,
-	            (unsigned long long)headers_over_stack_buf);
+	std::printf("[pagedir] page headers: max=%llu B\n", (unsigned long long)max_header_size);
 	if (bf_n == 0) {
 		std::printf("[pagedir] bloom: none  filesize=%llu\n", (unsigned long long)filesize);
 	} else {
@@ -1636,6 +1632,16 @@ AsyncResult ParquetReader::Scan(ClientContext &context, ParquetReaderScanState &
 						trans.Prefetch(GetGroupOffset(state), total_row_group_span);
 					}
 					state.current_group_prefetched = true;
+#ifdef __OSV__
+					// This branch bypasses ColumnReader::RegisterPrefetch (which locks for
+					// the per-column branch below), so lock explicitly here.
+					auto &root_reader = state.root_reader->Cast<StructColumnReader>();
+					for (idx_t i = 0; i < column_ids.size(); i++) {
+						auto col_idx = MultiFileLocalIndex(i);
+						auto file_col_idx = column_ids[col_idx];
+						root_reader.GetChildReader(file_col_idx).AcquireChunkLocks();
+					}
+#endif
 				}
 			} else {
 				// lazy fetching is when all tuples in a column can be skipped. With lazy fetching the buffer is only
@@ -1783,6 +1789,16 @@ AsyncResult ParquetReader::Scan(ClientContext &context, ParquetReaderScanState &
 
 	rows_read += scan_count;
 	state.offset_in_group += scan_count;
+#ifdef __OSV__
+	if (state.offset_in_group >= (idx_t)GetGroup(state).num_rows) {
+		// We just finished this row group's last batch, release chunk locks
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			auto col_idx = MultiFileLocalIndex(i);
+			auto file_col_idx = column_ids[col_idx];
+			root_reader.GetChildReader(file_col_idx).ReleaseChunkLocks();
+		}
+	}
+#endif
 	return SourceResultType::HAVE_MORE_OUTPUT;
 }
 

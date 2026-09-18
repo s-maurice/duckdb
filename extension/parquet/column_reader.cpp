@@ -116,6 +116,9 @@ ColumnReader::ColumnReader(const ParquetReader &reader, const ParquetColumnSchem
 }
 
 ColumnReader::~ColumnReader() {
+#ifdef __OSV__
+	ReleaseChunkLocks();
+#endif
 }
 
 Allocator &ColumnReader::GetAllocator() {
@@ -131,7 +134,36 @@ void ColumnReader::RegisterPrefetch(ParquetTransportBase &transport, bool allow_
 		uint64_t size = chunk->meta_data.total_compressed_size;
 		transport.RegisterPrefetch(FileOffset(), size, allow_merge);
 	}
+#ifdef __OSV__
+	AcquireChunkLocks();
+#endif
 }
+
+#ifdef __OSV__
+void ColumnReader::AcquireChunkLocks() {
+	if (!page_dir || chunk_lock_guard) return;
+	idx_t idx = row_group_idx * page_dir->num_cols + ColumnIndex();
+	// [start, end): page indices for this column chunk.
+	idx_t start = page_dir->chunk_start[idx];
+	idx_t end = start + page_dir->chunk_page_count[idx];
+	const size_t cpu_slot = osv_duckdb::GetThreadSlot();
+	for (idx_t i = start; i < end; i++) {
+		auto &pe = page_dir->pages[i];
+		osv_duckdb::u64 &local_version = page_dir->thread_versions[cpu_slot][i];
+		osv_duckdb::lockSWithFlush(pe.lock, local_version, vma_base + pe.offset,
+		                            static_cast<osv_duckdb::u64>(pe.page_size()));
+	}
+	auto *dir = page_dir;
+	// Deleter captures the exact locked range; runs on ReleaseChunkLocks() or destruction.
+	chunk_lock_guard = shared_ptr<void>(static_cast<void *>(nullptr), [dir, start, end](void *) {
+		for (idx_t i = start; i < end; i++) dir->pages[i].lock.unlockS();
+	});
+}
+
+void ColumnReader::ReleaseChunkLocks() {
+	chunk_lock_guard.reset();
+}
+#endif
 
 unique_ptr<BaseStatistics> ColumnReader::Stats(idx_t row_group_idx_p, const vector<ColumnChunk> &columns) {
 	return Schema().Stats(*reader.GetFileMetadata(), reader.parquet_options, row_group_idx_p, columns);
@@ -217,6 +249,7 @@ void ColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChun
 	page_dir       = page_dir_p;
 	row_group_idx  = row_group_idx_p;
 	vma_base       = reader.GetHandle().vma_base;
+	vma            = reader.GetHandle().vma;
 	D_ASSERT(vma_base != nullptr);
 	global_page_idx = page_dir->chunk_start[row_group_idx * page_dir->num_cols + ColumnIndex()];
 #endif
@@ -264,56 +297,11 @@ void ColumnReader::ReadDataEncrypted(const data_ptr_t buffer, const uint32_t buf
 }
 
 #ifdef __OSV__
-void ColumnReader::ReadPageHeaderOptimistic(PageHeader &page_hdr) {
-	if (reader.parquet_options.encryption_config) {
-		osv_duckdb::ScopedPagePin _pin(page_dir, global_page_idx, vma_base);
-		Read(page_hdr);
-		return;
-	}
-	auto &trans = GetParquetTransport(*protocol);
-	const idx_t start_pos = trans.GetLocation();
-
+void ColumnReader::ReadPageHeaderLocked(PageHeader &page_hdr) {
+	const bool already_locked = page_dir && static_cast<bool>(chunk_lock_guard);
 	auto &entry = page_dir->pages[global_page_idx];
-	auto &ps = entry.lock;
-
-	// Page header doesn't fit in the stack buffer, doing non-optimistic (pinned) read instead.
-	if (entry.header_size > osv_duckdb::MaxStackHeaderSize) {
-		std::printf("[pagedir] page header %llu B doesn't fit in the %llu B stack buffer, "
-		            "doing non-optimistic (pinned) read instead\n",
-		            (unsigned long long)entry.header_size,
-		            (unsigned long long)osv_duckdb::MaxStackHeaderSize);
-		osv_duckdb::ScopedPagePin _pin(page_dir, global_page_idx, vma_base);
-		Read(page_hdr);
-		return;
-	}
-
-	const size_t cpu_slot = osv_duckdb::GetThreadSlot();
-	osv_duckdb::u64 &local_version = page_dir->thread_versions[cpu_slot][global_page_idx];
-
-	osv_duckdb::validateFlushTlb(ps, local_version, vma_base + entry.offset,
-	                              static_cast<osv_duckdb::u64>(entry.page_size()));
-	const osv_duckdb::u64 v = local_version;
-
-	uint8_t buf[osv_duckdb::MaxStackHeaderSize];
-	std::memcpy(buf, vma_base + start_pos, entry.header_size);
-
-	if (ps.validateRead(v)) {
-		osv_duckdb::MemoryBufferTransport mem_trans_obj(buf, static_cast<uint32_t>(entry.header_size));
-		// Non-owning, and no control block to allocate.
-		using MemTransPtr = duckdb_base_std::shared_ptr<osv_duckdb::MemoryBufferTransport>;
-		MemTransPtr mem_trans(MemTransPtr(), &mem_trans_obj);
-		duckdb_apache::thrift::protocol::TCompactProtocolT<osv_duckdb::MemoryBufferTransport> mem_proto(mem_trans);
-		try {
-			reader.Read(page_hdr, mem_proto);
-			trans.Skip(mem_trans_obj.GetPosition());
-			return;
-		} catch (...) {
-			page_hdr = PageHeader{};
-		}
-	}
-
-	// Fallback: validation failed — take shared lock and read directly.
-	osv_duckdb::ScopedPagePin _pin(page_dir, global_page_idx, vma_base);
+	osv_duckdb::VmaPagePin _pin(vma_base + entry.offset, static_cast<uint64_t>(entry.page_size()),
+	                             page_dir, global_page_idx, vma_base, already_locked);
 	Read(page_hdr);
 }
 #endif
@@ -343,7 +331,7 @@ void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_
 	auto &trans = GetParquetTransport(*protocol);
 
 #ifdef __OSV__
-	ReadPageHeaderOptimistic(page_hdr);
+	ReadPageHeaderLocked(page_hdr);
 #else
 	if (trans.HasPrefetch()) {
 		// Already has some data prefetched, let's not mess with it
@@ -371,6 +359,13 @@ void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_
 		// this page has been filtered out so we don't need to read it
 		return;
 	}
+
+#ifdef __OSV__
+	{
+		auto &entry = page_dir->pages[current_page_idx];
+		osv_duckdb::enqueue_prefetch(vma, entry.offset, entry.page_size());
+	}
+#endif
 
 	switch (page_hdr.type) {
 	case PageType::DATA_PAGE_V2:
@@ -404,20 +399,23 @@ void ColumnReader::PreparePageV2(PageHeader &page_hdr) {
 	D_ASSERT(page_hdr.type == PageType::DATA_PAGE_V2);
 
 #ifdef __OSV__
+	const bool already_locked = page_dir && static_cast<bool>(chunk_lock_guard);
 	if (vma_base && !chunk->__isset.crypto_metadata &&
 	    chunk->meta_data.codec == CompressionCodec::UNCOMPRESSED) {
 		if (page_hdr.compressed_page_size != page_hdr.uncompressed_page_size) {
 			throw InvalidInputException("Failed to read file \"%s\": Page size mismatch", Reader().GetFileName());
 		}
 		auto &trans = GetParquetTransport(*protocol);
-		block = make_shared_ptr<osv_duckdb::VmaPinnedBuffer>(
+		block = make_shared_ptr<osv_duckdb::VmaPagePin>(
 		    vma_base + trans.GetLocation(),
 		    static_cast<uint64_t>(page_hdr.compressed_page_size),
-		    page_dir, current_page_idx, vma_base);
+		    page_dir, current_page_idx, vma_base, already_locked);
 		trans.Skip(page_hdr.compressed_page_size);
 		return;
 	}
-	osv_duckdb::ScopedPagePin _pin(page_dir, current_page_idx, vma_base);
+	osv_duckdb::VmaPagePin _pin(vma_base ? vma_base + GetParquetTransport(*protocol).GetLocation() : nullptr,
+	                             static_cast<uint64_t>(page_hdr.compressed_page_size),
+	                             page_dir, current_page_idx, vma_base, already_locked);
 #endif
 
 	AllocateBlock(page_hdr.uncompressed_page_size + 1);
@@ -451,6 +449,19 @@ void ColumnReader::PreparePageV2(PageHeader &page_hdr) {
 	auto compressed_bytes = page_hdr.compressed_page_size - uncompressed_bytes;
 
 	if (compressed_bytes > 0) {
+#ifdef __OSV__
+		if (vma_base && !chunk->__isset.crypto_metadata) {
+			// Decompress straight from VMA into block - _pin (already held above) makes
+			// this safe without copying the compressed bytes out first.
+			auto &trans = GetParquetTransport(*protocol);
+			DecompressInternal(chunk->meta_data.codec,
+			                   reinterpret_cast<const_data_ptr_t>(vma_base + trans.GetLocation()),
+			                   compressed_bytes, block->ptr + uncompressed_bytes,
+			                   page_hdr.uncompressed_page_size - uncompressed_bytes);
+			trans.Skip(compressed_bytes);
+			return;
+		}
+#endif
 		ResizeableBuffer compressed_buffer;
 		compressed_buffer.resize(GetAllocator(), compressed_bytes);
 
@@ -471,6 +482,7 @@ void ColumnReader::AllocateBlock(idx_t size) {
 
 void ColumnReader::PreparePage(PageHeader &page_hdr) {
 #ifdef __OSV__
+	const bool already_locked = page_dir && static_cast<bool>(chunk_lock_guard);
 	if (vma_base && !chunk->__isset.crypto_metadata &&
 	    chunk->meta_data.codec == CompressionCodec::UNCOMPRESSED) {
 		uint32_t compressed_page_size = page_hdr.compressed_page_size;
@@ -478,14 +490,16 @@ void ColumnReader::PreparePage(PageHeader &page_hdr) {
 			throw std::runtime_error("Page size mismatch");
 		}
 		auto &trans = GetParquetTransport(*protocol);
-		block = make_shared_ptr<osv_duckdb::VmaPinnedBuffer>(
+		block = make_shared_ptr<osv_duckdb::VmaPagePin>(
 		    vma_base + trans.GetLocation(),
 		    static_cast<uint64_t>(compressed_page_size),
-		    page_dir, current_page_idx, vma_base);
+		    page_dir, current_page_idx, vma_base, already_locked);
 		trans.Skip(compressed_page_size);
 		return;
 	}
-	osv_duckdb::ScopedPagePin _pin(page_dir, current_page_idx, vma_base);
+	osv_duckdb::VmaPagePin _pin(vma_base ? vma_base + GetParquetTransport(*protocol).GetLocation() : nullptr,
+	                             static_cast<uint64_t>(page_hdr.compressed_page_size),
+	                             page_dir, current_page_idx, vma_base, already_locked);
 #endif
 
 	AllocateBlock(page_hdr.uncompressed_page_size + 1);
@@ -509,6 +523,19 @@ void ColumnReader::PreparePage(PageHeader &page_hdr) {
 		ReadData(block->ptr, compressed_page_size, page_hdr.type);
 		return;
 	}
+
+#ifdef __OSV__
+	if (vma_base && !chunk->__isset.crypto_metadata) {
+		// Decompress straight from VMA into block - _pin (already held above) makes this
+		// safe without copying the compressed bytes out first.
+		auto &trans = GetParquetTransport(*protocol);
+		DecompressInternal(chunk->meta_data.codec,
+		                   reinterpret_cast<const_data_ptr_t>(vma_base + trans.GetLocation()),
+		                   compressed_page_size, block->ptr, page_hdr.uncompressed_page_size);
+		trans.Skip(compressed_page_size);
+		return;
+	}
+#endif
 
 	ResizeableBuffer compressed_buffer;
 	compressed_buffer.resize(GetAllocator(), compressed_page_size + 1);

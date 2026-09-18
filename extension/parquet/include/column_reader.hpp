@@ -126,6 +126,14 @@ public:
 	// register the range this reader will touch for prefetching
 	virtual void RegisterPrefetch(ParquetTransportBase &transport, bool allow_merge);
 
+#ifdef __OSV__
+	// S-lock every page in this reader's current row-group chunk. Idempotent (no-op if
+	// already locked, or if this reader has no pages of its own - e.g. wrapper readers).
+	virtual void AcquireChunkLocks();
+	// Release the locks taken by AcquireChunkLocks(). Idempotent.
+	virtual void ReleaseChunkLocks();
+#endif
+
 	unique_ptr<BaseStatistics> Stats(idx_t row_group_idx_p, const vector<ColumnChunk> &columns);
 
 	template <class VALUE_TYPE, class CONVERSION, bool HAS_DEFINES>
@@ -207,7 +215,7 @@ protected:
 	void Read(PageHeader &page_hdr);
 	void ReadData(const data_ptr_t buffer, const uint32_t buffer_size, PageType::type page_type);
 #ifdef __OSV__
-	void ReadPageHeaderOptimistic(PageHeader &page_hdr);
+	void ReadPageHeaderLocked(PageHeader &page_hdr);
 #endif
 
 private:
@@ -342,6 +350,8 @@ private:
 	idx_t                        global_page_idx  = 0;
 	idx_t                        current_page_idx = 0;
 	const char                  *vma_base         = nullptr;
+	ucache::VMA                 *vma              = nullptr;
+	shared_ptr<void>             chunk_lock_guard; // set by AcquireChunkLocks(); deleter unlocks on ReleaseChunkLocks()/destruction
 #endif
 
 	shared_ptr<ResizeableBuffer> block;

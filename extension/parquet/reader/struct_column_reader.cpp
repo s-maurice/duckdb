@@ -101,6 +101,26 @@ void StructColumnReader::RegisterPrefetch(ParquetTransportBase &transport, bool 
 	}
 }
 
+#ifdef __OSV__
+void StructColumnReader::AcquireChunkLocks() {
+	for (auto &child : child_readers) {
+		if (!child) {
+			continue;
+		}
+		child->AcquireChunkLocks();
+	}
+}
+
+void StructColumnReader::ReleaseChunkLocks() {
+	for (auto &child : child_readers) {
+		if (!child) {
+			continue;
+		}
+		child->ReleaseChunkLocks();
+	}
+}
+#endif
+
 uint64_t StructColumnReader::TotalCompressedSize() {
 	uint64_t size = 0;
 	for (auto &child : child_readers) {

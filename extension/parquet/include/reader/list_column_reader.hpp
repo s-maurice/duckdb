@@ -48,6 +48,15 @@ public:
 		child_column_reader->RegisterPrefetch(transport, allow_merge);
 	}
 
+#ifdef __OSV__
+	void AcquireChunkLocks() override {
+		child_column_reader->AcquireChunkLocks();
+	}
+	void ReleaseChunkLocks() override {
+		child_column_reader->ReleaseChunkLocks();
+	}
+#endif
+
 protected:
 	template <class OP>
 	idx_t ReadInternal(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out,

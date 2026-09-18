@@ -126,6 +126,26 @@ void VariantColumnReader::RegisterPrefetch(ParquetTransportBase &transport, bool
 	}
 }
 
+#ifdef __OSV__
+void VariantColumnReader::AcquireChunkLocks() {
+	for (auto &child : child_readers) {
+		if (!child) {
+			continue;
+		}
+		child->AcquireChunkLocks();
+	}
+}
+
+void VariantColumnReader::ReleaseChunkLocks() {
+	for (auto &child : child_readers) {
+		if (!child) {
+			continue;
+		}
+		child->ReleaseChunkLocks();
+	}
+}
+#endif
+
 uint64_t VariantColumnReader::TotalCompressedSize() {
 	uint64_t size = 0;
 	for (auto &child : child_readers) {

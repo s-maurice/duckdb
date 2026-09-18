@@ -40,6 +40,10 @@ public:
 	idx_t GroupRowsAvailable() override;
 	uint64_t TotalCompressedSize() override;
 	void RegisterPrefetch(ParquetTransportBase &transport, bool allow_merge) override;
+#ifdef __OSV__
+	void AcquireChunkLocks() override;
+	void ReleaseChunkLocks() override;
+#endif
 	static bool TypedValueLayoutToType(const LogicalType &typed_value, LogicalType &logical_type);
 
 protected:

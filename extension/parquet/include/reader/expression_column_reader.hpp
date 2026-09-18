@@ -56,6 +56,15 @@ public:
 	void RegisterPrefetch(ParquetTransportBase &transport, bool allow_merge) override {
 		child_reader->RegisterPrefetch(transport, allow_merge);
 	}
+
+#ifdef __OSV__
+	void AcquireChunkLocks() override {
+		child_reader->AcquireChunkLocks();
+	}
+	void ReleaseChunkLocks() override {
+		child_reader->ReleaseChunkLocks();
+	}
+#endif
 };
 
 } // namespace duckdb
