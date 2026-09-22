@@ -58,6 +58,66 @@ CreateThriftFileProtocol(QueryContext /*context*/, ::osv_duckdb::OsvCachingFileH
 	    std::move(transport));
 }
 
+// Maps each row group to a PageEntry ("bloom-group") covering its bloom filter bytes,
+// merging consecutive row groups until the group hits a minimum size.
+// Must run after data pages are appended, so dir.pages stays offset-ordered.
+static void BuildBloomLockGroups(const FileMetaData &meta, ::osv_duckdb::PageDirectory &dir,
+                                  const duckdb::string &path) {
+	using ::osv_duckdb::PageDirectory;
+	const auto &row_groups = meta.row_groups;
+	const idx_t num_rgs = static_cast<idx_t>(row_groups.size());
+
+	dir.rg_bloom_page.assign(num_rgs, static_cast<idx_t>(PageDirectory::NO_BLOOM_PAGE));
+	constexpr idx_t MIN_BLOOMGROUP_BYTES = 4 * 4096;
+	constexpr idx_t MAX_ROWGROUPS_PER_BLOOMGROUP = 64;
+	idx_t bloom_group_page = PageDirectory::NO_BLOOM_PAGE;  // dir.pages index of the currently-open bloom-group
+	idx_t bloom_group_lo = 0;                               // first row group folded into it
+	idx_t bloom_group_min = 0;                              // its starting byte offset
+	idx_t bloom_last_max = 0;                               // end of the last row group's bloom bytes seen so far
+
+	for (idx_t rg = 0; rg < num_rgs; rg++) {
+		// This row group's own bloom filter byte range, across its columns.
+		idx_t rg_bf_min = PageDirectory::NO_BLOOM_PAGE;
+		idx_t rg_bf_max = 0;
+		idx_t rg_bf_bytes = 0;
+		for (const auto &chunk : row_groups[rg].columns) {
+			const auto &chunk_meta = chunk.meta_data;
+			if (!chunk_meta.__isset.bloom_filter_offset || chunk_meta.bloom_filter_offset <= 0 ||
+			    !chunk_meta.__isset.bloom_filter_length || chunk_meta.bloom_filter_length <= 0)
+				continue;
+			const idx_t bf_off = static_cast<idx_t>(chunk_meta.bloom_filter_offset);
+			const idx_t bf_len = static_cast<idx_t>(chunk_meta.bloom_filter_length);
+			if (bf_off < rg_bf_min) rg_bf_min = bf_off;
+			if (bf_off + bf_len > rg_bf_max) rg_bf_max = bf_off + bf_len;
+			rg_bf_bytes += bf_len;
+		}
+		if (rg_bf_bytes == 0)
+			continue;
+
+		// Check that bloom filters within a row group are contiguous.
+		// (bloom filters are written back-to-back, in row group order.)
+		if (rg_bf_max - rg_bf_min != rg_bf_bytes || rg_bf_min < bloom_last_max) {
+			throw InvalidInputException("File '%s' row group %llu has non-contiguous bloom filters",
+			                            path, (unsigned long long)rg);
+		}
+
+		// check if we should extend or start a new bloom group.
+		bool extend = bloom_group_page != PageDirectory::NO_BLOOM_PAGE &&
+		              (bloom_last_max - bloom_group_min) < MIN_BLOOMGROUP_BYTES &&
+		              (rg - bloom_group_lo) < MAX_ROWGROUPS_PER_BLOOMGROUP;
+		if (extend) {
+			dir.pages[bloom_group_page].body_size = rg_bf_max - bloom_group_min;
+		} else {
+			bloom_group_page = static_cast<idx_t>(dir.pages.size());
+			dir.pages.emplace_back(rg_bf_min, /*header_size=*/0, rg_bf_max - rg_bf_min);
+			bloom_group_min = rg_bf_min;
+			bloom_group_lo = rg;
+		}
+		dir.rg_bloom_page[rg] = bloom_group_page;
+		bloom_last_max = rg_bf_max;
+	}
+}
+
 static ::osv_duckdb::PageDirectory
 BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckdb::string &path) {
 	using ::osv_duckdb::PageDirectory;
@@ -182,6 +242,8 @@ BuildPageDirectory(const FileMetaData &meta, duckdb::FileSystem &fs, const duckd
 		            (unsigned long long)((span + 4095) / 4096), (unsigned long long)filesize,
 		            filesize ? 100.0 * (double)(filesize - bf_min_off) / (double)filesize : 0.0);
 	}
+
+	BuildBloomLockGroups(meta, dir, path);
 	return dir;
 }
 #endif
@@ -1593,6 +1655,22 @@ AsyncResult ParquetReader::Scan(ClientContext &context, ParquetReaderScanState &
 		// TODO: only need this if we have a deletion vector?
 		state.group_offset = GetRowGroupOffset(state.root_reader->Reader(), state.group_idx_list[state.current_group]);
 
+#ifdef __OSV__
+		// Look up and SLock this row group's bloom-group PageEntry for the duration of the
+		// bloom filter check.
+		::osv_duckdb::OptionalVmaPagePin bloom_pin;
+		auto *bloom_dir = state.file_handle->page_dir;
+		if (filters && bloom_dir) {
+			idx_t bloom_page = bloom_dir->rg_bloom_page[state.group_idx_list[state.current_group]];
+			if (bloom_page != ::osv_duckdb::PageDirectory::NO_BLOOM_PAGE) {
+				auto &bloom_entry = bloom_dir->pages[bloom_page];
+				bloom_pin.Emplace(state.file_handle->vma_base + bloom_entry.offset,
+				                  static_cast<uint64_t>(bloom_entry.page_size()), bloom_dir,
+				                  bloom_page, state.file_handle->vma_base);
+				bloom_pin->Prefetch(state.file_handle->vma);
+			}
+		}
+#endif
 		uint64_t to_scan_compressed_bytes = 0;
 		for (idx_t i = 0; i < column_ids.size(); i++) {
 			auto col_idx = MultiFileLocalIndex(i);
@@ -1603,6 +1681,9 @@ AsyncResult ParquetReader::Scan(ClientContext &context, ParquetReaderScanState &
 			auto &root_reader = state.root_reader->Cast<StructColumnReader>();
 			to_scan_compressed_bytes += root_reader.GetChildReader(file_col_idx).TotalCompressedSize();
 		}
+#ifdef __OSV__
+		bloom_pin.Reset();
+#endif
 
 		auto &group = GetGroup(state);
 		if (state.op) {
