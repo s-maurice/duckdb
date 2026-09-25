@@ -370,13 +370,6 @@ void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_
 		return;
 	}
 
-#ifdef __OSV__
-	{
-		auto &entry = page_dir->pages[current_page_idx];
-		osv_duckdb::enqueue_prefetch(vma, entry.offset, entry.page_size());
-	}
-#endif
-
 	switch (page_hdr.type) {
 	case PageType::DATA_PAGE_V2:
 		PreparePageV2(page_hdr);
