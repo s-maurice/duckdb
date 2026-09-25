@@ -1708,14 +1708,16 @@ AsyncResult ParquetReader::Scan(ClientContext &context, ParquetReaderScanState &
 			if (!filters && scan_percentage > ParquetReaderPrefetchConfig::WHOLE_GROUP_PREFETCH_MINIMUM_SCAN) {
 				// Prefetch the whole row group
 				if (!state.current_group_prefetched) {
+#ifndef __OSV__
 					auto total_compressed_size = GetGroupCompressedSize(state);
 					if (total_compressed_size > 0) {
 						trans.Prefetch(GetGroupOffset(state), total_row_group_span);
 					}
+#endif
 					state.current_group_prefetched = true;
 #ifdef __OSV__
 					// This branch bypasses ColumnReader::RegisterPrefetch (which locks for
-					// the per-column branch below), so lock explicitly here.
+					// the per-column branch below), so lock and prefetch explicitly here.
 					auto &root_reader = state.root_reader->Cast<StructColumnReader>();
 					for (idx_t i = 0; i < column_ids.size(); i++) {
 						auto col_idx = MultiFileLocalIndex(i);

@@ -130,12 +130,14 @@ const ParquetReader &ColumnReader::Reader() {
 }
 
 void ColumnReader::RegisterPrefetch(ParquetTransportBase &transport, bool allow_merge) {
+#ifdef __OSV__
+	// On OSv, AcquireChunkLocks prefetches after locking.
+	AcquireChunkLocks();
+#else
 	if (chunk) {
 		uint64_t size = chunk->meta_data.total_compressed_size;
 		transport.RegisterPrefetch(FileOffset(), size, allow_merge);
 	}
-#ifdef __OSV__
-	AcquireChunkLocks();
 #endif
 }
 
@@ -147,11 +149,19 @@ void ColumnReader::AcquireChunkLocks() {
 	idx_t start = page_dir->chunk_start[idx];
 	idx_t end = start + page_dir->chunk_page_count[idx];
 	const size_t cpu_slot = osv_duckdb::GetThreadSlot();
+	idx_t lo = NumericLimits<idx_t>::Maximum();
+	idx_t hi = 0;
 	for (idx_t i = start; i < end; i++) {
 		auto &pe = page_dir->pages[i];
 		osv_duckdb::u64 &local_version = page_dir->thread_versions[cpu_slot][i];
 		osv_duckdb::lockSWithFlush(pe.lock, local_version, vma_base + pe.offset,
 		                            static_cast<osv_duckdb::u64>(pe.page_size()));
+		lo = MinValue<idx_t>(lo, pe.offset);
+		hi = MaxValue<idx_t>(hi, pe.offset + pe.page_size());
+	}
+	// Prefetch only while holding the locks.
+	if (hi > lo) {
+		osv_duckdb::enqueue_prefetch(vma, lo, hi - lo);
 	}
 	auto *dir = page_dir;
 	// Deleter captures the exact locked range; runs on ReleaseChunkLocks() or destruction.
