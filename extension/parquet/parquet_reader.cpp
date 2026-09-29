@@ -50,11 +50,24 @@ CreateThriftFileProtocol(QueryContext context, CachingFileHandle &file_handle, b
 	return make_uniq<duckdb_apache::thrift::protocol::TCompactProtocolT<ThriftFileTransport>>(std::move(transport));
 }
 
+static unique_ptr<duckdb_apache::thrift::protocol::TProtocol>
+CreateMetadataProtocol(QueryContext context, CachingFileHandle &file_handle) {
+	return CreateThriftFileProtocol(context, file_handle, false);
+}
+
 #ifdef __OSV__
 static unique_ptr<duckdb_apache::thrift::protocol::TProtocol>
 CreateThriftFileProtocol(QueryContext /*context*/, ::osv_duckdb::OsvCachingFileHandle &file_handle, bool prefetch_mode) {
 	auto transport = duckdb_base_std::make_shared<::osv_duckdb::OsvThriftFileTransport>(file_handle, prefetch_mode);
 	return make_uniq<duckdb_apache::thrift::protocol::TCompactProtocolT<::osv_duckdb::OsvThriftFileTransport>>(
+	    std::move(transport));
+}
+
+// Reads the footer through the inner file handle instead of the VMA.
+static unique_ptr<duckdb_apache::thrift::protocol::TProtocol>
+CreateMetadataProtocol(QueryContext /*context*/, ::osv_duckdb::OsvCachingFileHandle &file_handle) {
+	auto transport = duckdb_base_std::make_shared<::osv_duckdb::OsvFooterTransport>(file_handle);
+	return make_uniq<duckdb_apache::thrift::protocol::TCompactProtocolT<::osv_duckdb::OsvFooterTransport>>(
 	    std::move(transport));
 }
 
@@ -296,7 +309,7 @@ static shared_ptr<ParquetFileMetadataCache>
 LoadMetadata(ClientContext &context, Allocator &allocator, FileHandleT &file_handle,
              const shared_ptr<const ParquetEncryptionConfig> &encryption_config,
              shared_ptr<EncryptionUtil> &encryption_util, optional_idx footer_size) {
-	auto file_proto = CreateThriftFileProtocol(context, file_handle, false);
+	auto file_proto = CreateMetadataProtocol(context, file_handle);
 	auto &transport = GetParquetTransport(*file_proto);
 	auto file_size = transport.GetSize();
 	if (file_size < 12) {
