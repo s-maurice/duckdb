@@ -148,14 +148,11 @@ void ColumnReader::AcquireChunkLocks() {
 	// [start, end): page indices for this column chunk.
 	idx_t start = page_dir->chunk_start[idx];
 	idx_t end = start + page_dir->chunk_page_count[idx];
-	const size_t cpu_slot = osv_duckdb::GetThreadSlot();
 	idx_t lo = NumericLimits<idx_t>::Maximum();
 	idx_t hi = 0;
 	for (idx_t i = start; i < end; i++) {
+		osv_duckdb::LockPageS(page_dir, i, vma_base);
 		auto &pe = page_dir->pages[i];
-		osv_duckdb::u64 &local_version = page_dir->thread_versions[cpu_slot][i];
-		osv_duckdb::lockSWithFlush(pe.lock, local_version, vma_base + pe.offset,
-		                            static_cast<osv_duckdb::u64>(pe.page_size()));
 		lo = MinValue<idx_t>(lo, pe.offset);
 		hi = MaxValue<idx_t>(hi, pe.offset + pe.page_size());
 	}
