@@ -400,6 +400,7 @@ void ColumnReader::PreparePageV2(PageHeader &page_hdr) {
 
 #ifdef __OSV__
 	const bool already_locked = page_dir && static_cast<bool>(chunk_lock_guard);
+#if DUCKDB_ZERO_COPY
 	if (vma_base && !chunk->__isset.crypto_metadata &&
 	    chunk->meta_data.codec == CompressionCodec::UNCOMPRESSED) {
 		if (page_hdr.compressed_page_size != page_hdr.uncompressed_page_size) {
@@ -413,6 +414,7 @@ void ColumnReader::PreparePageV2(PageHeader &page_hdr) {
 		trans.Skip(page_hdr.compressed_page_size);
 		return;
 	}
+#endif
 	osv_duckdb::VmaPagePin _pin(vma_base ? vma_base + GetParquetTransport(*protocol).GetLocation() : nullptr,
 	                             static_cast<uint64_t>(page_hdr.compressed_page_size),
 	                             page_dir, current_page_idx, vma_base, already_locked);
@@ -449,7 +451,7 @@ void ColumnReader::PreparePageV2(PageHeader &page_hdr) {
 	auto compressed_bytes = page_hdr.compressed_page_size - uncompressed_bytes;
 
 	if (compressed_bytes > 0) {
-#ifdef __OSV__
+#if defined(__OSV__) && DUCKDB_ZERO_COPY
 		if (vma_base && !chunk->__isset.crypto_metadata) {
 			// Decompress straight from VMA into block - _pin (already held above) makes
 			// this safe without copying the compressed bytes out first.
@@ -483,6 +485,7 @@ void ColumnReader::AllocateBlock(idx_t size) {
 void ColumnReader::PreparePage(PageHeader &page_hdr) {
 #ifdef __OSV__
 	const bool already_locked = page_dir && static_cast<bool>(chunk_lock_guard);
+#if DUCKDB_ZERO_COPY
 	if (vma_base && !chunk->__isset.crypto_metadata &&
 	    chunk->meta_data.codec == CompressionCodec::UNCOMPRESSED) {
 		uint32_t compressed_page_size = page_hdr.compressed_page_size;
@@ -497,6 +500,7 @@ void ColumnReader::PreparePage(PageHeader &page_hdr) {
 		trans.Skip(compressed_page_size);
 		return;
 	}
+#endif
 	osv_duckdb::VmaPagePin _pin(vma_base ? vma_base + GetParquetTransport(*protocol).GetLocation() : nullptr,
 	                             static_cast<uint64_t>(page_hdr.compressed_page_size),
 	                             page_dir, current_page_idx, vma_base, already_locked);
@@ -524,7 +528,7 @@ void ColumnReader::PreparePage(PageHeader &page_hdr) {
 		return;
 	}
 
-#ifdef __OSV__
+#if defined(__OSV__) && DUCKDB_ZERO_COPY
 	if (vma_base && !chunk->__isset.crypto_metadata) {
 		// Decompress straight from VMA into block - _pin (already held above) makes this
 		// safe without copying the compressed bytes out first.
