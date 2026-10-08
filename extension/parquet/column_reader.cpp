@@ -163,7 +163,7 @@ void ColumnReader::AcquireChunkLocks() {
 	auto *dir = page_dir;
 	// Deleter captures the exact locked range; runs on ReleaseChunkLocks() or destruction.
 	chunk_lock_guard = shared_ptr<void>(static_cast<void *>(nullptr), [dir, start, end](void *) {
-		for (idx_t i = start; i < end; i++) dir->pages[i].lock.unlockS();
+		for (idx_t i = start; i < end; i++) osv_duckdb::UnlockPageS(dir, i);
 	});
 }
 
